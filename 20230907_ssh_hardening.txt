@@ -1,45 +1,170 @@
-# Install
+# Linux Server Hardening Guide (Debian 12 Bookworm)
 
-```
-apt-get install ssh-audit
+This guide covers SSH hardening (Phase 1) and broader system security (Phase 2), including Nginx, kernel tweaks, and intrusion prevention.
 
+---
+
+## Phase 1: SSH Hardening
+
+### 1. Audit & Baseline
+Install `ssh-audit` to identify weak configurations.
+```bash
+apt-get update && apt-get install -y ssh-audit
 ssh-audit localhost
 ```
 
-# Hardening
-
-Generate new keys
-
-```
+### 2. Generate Strong Host Keys
+Replace existing keys with high-entropy versions.
+```bash
+# Generate 4096-bit RSA and Ed25519 keys
 ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N ""
 ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ""
 ```
 
-remove small diffie-hellman
-
-```
+### 3. Secure Diffie-Hellman Moduli
+Remove small primes (less than 3071 bits) to prevent Logjam-style attacks.
+```bash
 awk '$5 >= 3071' /etc/ssh/moduli > /etc/ssh/moduli.safe
 mv /etc/ssh/moduli.safe /etc/ssh/moduli
 ```
 
-Enable RSA and ED25519 keys
-```
-vim /etc/sshd/sshd_config
+### 4. SSH Daemon Configuration
+Edit `/etc/ssh/sshd_config` to enforce modern keys and disable root login.
 
-
-...
+```text
+# Explicitly define host keys
 HostKey /etc/ssh/ssh_host_rsa_key
-#HostKey /etc/ssh/ssh_host_ecdsa_key
 HostKey /etc/ssh/ssh_host_ed25519_key
-...
+
+# Disable legacy/weak authentication
 PermitRootLogin no
-
+MaxAuthTries 3
+LoginGraceTime 20
+PermitEmptyPasswords no
+KerberosAuthentication no
+GSSAPIAuthentication no
 ```
 
-Restrict supported key exchange, cypher and mac algorithms
+### 5. Restrict Algorithms (Ciphers, MACs, KEX) and post-quantum
+Create a dedicated hardening configuration file. This list mitigates the **Terrapin** vulnerability by removing vulnerable Chacha20-Poly1305 variants.
+
+```bash
+cat <<EOF > /etc/ssh/sshd_config.d/ssh-audit_hardening.conf
+# Secure algorithms as per sshaudit.com hardening guide
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256
+Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com
+HostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com,rsa-sha2-256,rsa-sha2-512,rsa-sha2-256-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com
+EOF
+
+sed -i 's/KexAlgorithms /KexAlgorithms sntrup761x25519-sha512@openssh.com,/g' /etc/ssh/sshd_config.d/ssh-audit_hardening.conf
 ```
-echo -e "\n# Restrict key exchange, cipher, and MAC algorithms, as per sshaudit.com\n# hardening guide.\nKexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256\nCiphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr\nMACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com\nHostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com,rsa-sha2-256,rsa-sha2-512,rsa-sha2-256-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com" > /etc/ssh/sshd_config.d/ssh-audit_hardening.conf
 
+### 6. Connection Rate Throttling (iptables)
+Protects against **DHEat** DoS attacks by limiting new connections to 10 every 10 seconds.
+```bash
+apt install -y iptables netfilter-persistent iptables-persistent
+
+# IPv4 Throttling
+iptables -I INPUT -p tcp --dport 22 -m state --state NEW -m recent --set
+iptables -I INPUT -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 10 --hitcount 10 -j DROP
+
+# IPv6 Throttling
+ip6tables -I INPUT -p tcp --dport 22 -m state --state NEW -m recent --set
+ip6tables -I INPUT -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 10 --hitcount 10 -j DROP
+
+# Persist rules
+netfilter-persistent save
 ```
 
+---
 
+## Phase 2: System & Web Hardening
+
+### 1. Nginx Security
+Hide information and add security headers in `/etc/nginx/nginx.conf` and site configs.
+
+**Global Setting:**
+```nginx
+http {
+    server_tokens off;
+}
+```
+
+**Site Headers & TLS:**
+```nginx
+# Security Headers
+add_header X-Frame-Options "SAMEORIGIN";
+add_header X-Content-Type-Options "nosniff";
+add_header X-XSS-Protection "1; mode=block";
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; object-src 'none';";
+
+# Modern TLS
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_prefer_server_ciphers on;
+# Generate dhparam.pem: openssl dhparam -out /etc/nginx/dhparam.pem 4096
+ssl_dhparam /etc/nginx/dhparam.pem;
+```
+
+### 2. Intrusion Prevention (Fail2Ban)
+```bash
+apt install fail2ban -y
+cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local
+```
+Enable SSH and Nginx jails in `/etc/fail2ban/jail.d/hardening.conf`:
+
+```
+[DEFAULT]
+# Whitelist your own IP here to avoid lockouts
+ignoreip = 127.0.0.1/8 ::1 <YOUR_OFFICE_OR_HOME_IP>
+
+[sshd]
+enabled = true
+port    = ssh
+maxretry = 3
+bantime  = 1h
+
+[nginx-http-auth]
+enabled = true
+port    = http,https
+logpath = /var/log/nginx/error.log
+
+[nginx-botsearch]
+enabled = true
+port    = http,https
+logpath = /var/log/nginx/access.log
+maxretry = 2
+
+[recidive]
+enabled = true
+logpath = /var/log/fail2ban.log
+bantime = 1w
+findtime = 1d
+maxretry = 3
+```
+
+### 3. Kernel Hardening (sysctl)
+Apply network protections in `/etc/sysctl.d/99-hardened.conf`:
+```text
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.conf.all.log_martians = 1
+```
+Apply with: `sysctl -p /etc/sysctl.d/99-hardened.conf`
+
+### 4. File Integrity & Automation
+*   **Secure Shared Memory:** Add `tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0` to `/etc/fstab`.
+*   **Auto Updates:** `apt install unattended-upgrades -y && dpkg-reconfigure -plow unattended-upgrades`.
+*   **Integrity Monitoring:** Use `aide` to baseline system binaries.
+
+### 5. Final Sanity Checks
+*   **No Password-less accounts:** `awk -F: '($2 == "") {print $1}' /etc/shadow`
+*   **World-Writable Files:** `find / -xdev -type f -perm -0002 -print`
+*   **Sudoers Audit:** `visudo` (Ensure `Defaults use_pty` is present).
