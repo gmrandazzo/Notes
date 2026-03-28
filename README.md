@@ -5,7 +5,7 @@ A personal collection of technical notes, configuration snippets, and utility sc
 ## 📂 Repository Structure
 
 ### 🛡️ Security & Hardening
-- [SSH Hardening Guide (Debian 12)](20230907_ssh_hardening.txt) - Comprehensive guide for securing SSH, Nginx, and kernel parameters.
+- [SSH Hardening Guide (Debian)](20230907_ssh_hardening.txt) - Comprehensive guide for securing SSH, Nginx, and kernel parameters.
 - [Check Suspicious Connections](20220517_check_suspicious_connection.bash) - Bash script to audit active network connections.
 
 ### 🐧 Linux Administration (Debian)
